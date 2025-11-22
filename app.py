@@ -2,6 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from datetime import datetime, timedelta
+
+# nsepython imports
+from nsepython import nse_optionchain_scrapper, pcr, expiry_list, indiavix
+
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -12,11 +17,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("📊 NSE Market Dashboard with Option Chain (Yahoo Finance)")
-st.caption(
-    "Educational / personal use only – data from Yahoo Finance (delayed), "
-    "not for live trading decisions."
-)
+st.title("📊 NSE Market Dashboard with Option Chain Analysis")
+st.caption("Educational / personal use only – data from public sources, not for live trading decisions.")
 
 # ---------------------- HELPER FUNCTIONS ---------------------- #
 
@@ -24,21 +26,15 @@ st.caption(
 def get_yf_data(tickers, period="3mo", interval="1d"):
     if not tickers:
         return None
-    data = yf.download(
-        tickers,
-        period=period,
-        interval=interval,
-        progress=False,
-        group_by="ticker",
-        auto_adjust=True,
-    )
+    data = yf.download(tickers, period=period, interval=interval, progress=False, group_by="ticker", auto_adjust=True)
     return data
 
 def parse_watchlist(text):
     if not text:
         return []
     syms = [s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()]
-    yf_syms = [s + ".NS" for s in syms]   # NSE stocks on Yahoo: RELIANCE.NS, TCS.NS, etc.:contentReference[oaicite:1]{index=1}
+    # yfinance uses .NS for NSE stocks
+    yf_syms = [s + ".NS" for s in syms]
     return syms, yf_syms
 
 def compute_trending_metrics(raw_symbols, yf_symbols, period="1mo"):
@@ -52,13 +48,14 @@ def compute_trending_metrics(raw_symbols, yf_symbols, period="1mo"):
     closing = {}
     volume = {}
 
-    # yfinance shape differs for single vs multi-ticker
+    # yfinance shape differs for single vs multi ticker
     if isinstance(data.columns, pd.MultiIndex):
         for s, yf_s in zip(raw_symbols, yf_symbols):
             if (yf_s, "Close") in data.columns:
                 closing[s] = data[(yf_s, "Close")]
                 volume[s] = data[(yf_s, "Volume")]
     else:
+        # single symbol
         s = raw_symbols[0]
         closing[s] = data["Close"]
         volume[s] = data["Volume"]
@@ -86,81 +83,45 @@ def compute_trending_metrics(raw_symbols, yf_symbols, period="1mo"):
     df["Avg Vol 20D"] = avg_vol_20
     df["Vol Spike"] = df["Latest Vol"] / df["Avg Vol 20D"]
 
+    # Simple trend score
     df["Trend Score"] = (
         df["1D %"] * 0.4 +
         df["5D %"] * 0.3 +
         df["1M %"] * 0.2 +
-        (df["Vol Spike"] - 1).fillna(0) * 5
+        (df["Vol Spike"] - 1).fillna(0) * 5  # overweight big spikes
     )
 
     return df.sort_values("Trend Score", ascending=False)
 
-def map_to_yf_option_symbol(sym: str) -> str:
-    """
-    Map a user-friendly NSE symbol to Yahoo Finance symbol for options.
-    NIFTY -> ^NSEI, BANKNIFTY -> ^NSEBANK, stocks -> SYMBOL.NS
-    """
-    s = sym.upper().strip()
-    if s in ["NIFTY", "NIFTY50", "NIFTY 50"]:
-        return "^NSEI"       # NIFTY 50 index on Yahoo:contentReference[oaicite:2]{index=2}
-    if s in ["BANKNIFTY", "NIFTYBANK", "BANK NIFTY"]:
-        return "^NSEBANK"    # NIFTY BANK index on Yahoo:contentReference[oaicite:3]{index=3}
-    if s.startswith("^"):
-        return s
-    if not s.endswith(".NS"):
-        return s + ".NS"
-    return s
-
-@st.cache_data(ttl=120)
-def get_option_chain_from_yf(yf_symbol: str):
-    """
-    Use yfinance to get available expiries and option chain for a symbol.
-    """
-    ticker = yf.Ticker(yf_symbol)
-    expiries = list(ticker.options)  # list of expiry dates as strings:contentReference[oaicite:4]{index=4}
-    return ticker, expiries
-
-def build_option_chain_df(chain):
-    """
-    Convert yfinance option_chain result into a combined CE+PE DataFrame.
-    """
-    calls = chain.calls.copy()
-    puts = chain.puts.copy()
-
-    # Keep only relevant columns if present
-    ce_cols = ["strike", "openInterest", "lastPrice", "volume"]
-    pe_cols = ["strike", "openInterest", "lastPrice", "volume"]
-
-    calls = calls[[c for c in ce_cols if c in calls.columns]]
-    puts = puts[[c for c in pe_cols if c in puts.columns]]
-
-    df = pd.merge(
-        calls,
-        puts,
-        on="strike",
-        how="outer",
-        suffixes=("_CE", "_PE"),
-    ).sort_values("strike")
-
-    df.rename(
-        columns={
-            "strike": "strikePrice",
-            "openInterest_CE": "CE_OI",
-            "lastPrice_CE": "CE_LTP",
-            "volume_CE": "CE_Volume",
-            "openInterest_PE": "PE_OI",
-            "lastPrice_PE": "PE_LTP",
-            "volume_PE": "PE_Volume",
-        },
-        inplace=True,
-    )
-
-    # Fill NaNs with 0 for numeric columns
-    for col in ["CE_OI", "CE_LTP", "CE_Volume", "PE_OI", "PE_LTP", "PE_Volume"]:
-        if col in df.columns:
-            df[col] = df[col].fillna(0)
-
+def option_chain_to_df(payload, expiry):
+    rows = []
+    for row in payload["records"]["data"]:
+        if row.get("expiryDate") != expiry:
+            continue
+        strike = row.get("strikePrice")
+        ce = row.get("CE", {})
+        pe = row.get("PE", {})
+        rows.append(
+            {
+                "strikePrice": strike,
+                "CE_OI": ce.get("openInterest"),
+                "CE_Change_OI": ce.get("changeinOpenInterest"),
+                "CE_LTP": ce.get("lastPrice"),
+                "CE_Volume": ce.get("totalTradedVolume"),
+                "PE_OI": pe.get("openInterest"),
+                "PE_Change_OI": pe.get("changeinOpenInterest"),
+                "PE_LTP": pe.get("lastPrice"),
+                "PE_Volume": pe.get("totalTradedVolume"),
+            }
+        )
+    df = pd.DataFrame(rows).sort_values("strikePrice")
     return df
+
+@st.cache_data(ttl=60)
+def fetch_option_chain(symbol):
+    # symbol: NIFTY, BANKNIFTY, or stock e.g. RELIANCE
+    payload = nse_optionchain_scrapper(symbol.upper())
+    return payload
 
 # ---------------------- SIDEBAR ---------------------- #
 st.sidebar.header("⚙️ Settings")
@@ -170,23 +131,23 @@ watchlist_text = st.sidebar.text_area(
     "Watchlist symbols (NSE, comma separated)",
     value=default_watchlist,
     height=100,
-    help="Example: RELIANCE,TCS,INFY,SBIN",
+    help="Example: RELIANCE,TCS,INFY,SBIN"
 )
 
 trend_period = st.sidebar.selectbox(
     "Trend lookback for stocks",
     options=["1mo", "3mo", "6mo"],
-    index=0,
+    index=0
 )
 
 st.sidebar.info(
-    "Once this app is deployed, you can open it from any laptop/phone.\n"
-    "Just update your watchlist here."
+    "You can open this app from any laptop once deployed on Streamlit Cloud.\n"
+    "Just paste/update your watchlist here."
 )
 
 # ---------------------- TABS ---------------------- #
 tab1, tab2, tab3 = st.tabs(
-    ["📈 Market & Stocks", "📊 Gainers / Losers", "🧮 Option Chain"]
+    ["📈 Market & Stocks", "📊 Gainers / Losers", "🧮 Option Chain Analysis"]
 )
 
 # ---------------------- TAB 1: MARKET & TRENDING ---------------------- #
@@ -207,29 +168,18 @@ with tab1:
                     use_container_width=True,
                 )
 
-                top_n = st.slider(
-                    "Show top N by Trend Score",
-                    3,
-                    min(15, len(trend_df)),
-                    10,
-                )
-                chart_df = (
-                    trend_df.head(top_n)
-                    .reset_index()
-                    .rename(columns={"index": "Symbol"})
-                )
+                # Bar chart of Trend Score
+                top_n = st.slider("Show top N by Trend Score", 3, min(15, len(trend_df)), 10)
+                chart_df = trend_df.head(top_n).reset_index().rename(columns={"index": "Symbol"})
                 fig = px.bar(
                     chart_df,
                     x="Symbol",
                     y="Trend Score",
-                    hover_data=["1D %", "5D %", "1M %", "Vol Spike"],
+                    hover_data=["1D %", "5D %", "1M %", "Vol Spike"]
                 )
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.warning(
-                    "Could not fetch data for your watchlist. "
-                    "Try different symbols or check connectivity."
-                )
+                st.warning("Could not fetch data for your watchlist. Try a different set or check internet connectivity.")
         else:
             st.info("Add some symbols in the sidebar to see trending stocks.")
 
@@ -237,13 +187,18 @@ with tab1:
         st.markdown("#### ℹ️ Notes")
         st.write(
             """
-            - **Trend Score** combines:
+            - **Trend Score** mixes:
               - 1D / 5D / 1M % returns  
               - 20D volume spike  
-            - Higher score ≈ more momentum + activity.  
-            - For educational analysis only, **not** a trading signal.
+            - Higher score ≈ more trending (momentum + activity).  
+            - This is for **educational analysis only**, not a trading signal.
             """
         )
+        try:
+            vix = indiavix()
+            st.metric("India VIX (approx)", f"{vix:.2f}")
+        except Exception:
+            st.caption("India VIX unavailable right now.")
 
 # ---------------------- TAB 2: GAINERS / LOSERS ---------------------- #
 with tab2:
@@ -260,154 +215,124 @@ with tab2:
             with col_g:
                 st.markdown("##### 🔼 Top Gainers (1D %)")
                 gainers = today_change.head(10).copy()
-                st.dataframe(
-                    gainers[["Last Price", "1D %", "5D %", "1M %", "Vol Spike"]].round(2)
-                )
+                st.dataframe(gainers[["Last Price", "1D %", "5D %", "1M %", "Vol Spike"]].round(2))
 
             with col_l:
                 st.markdown("##### 🔽 Top Losers (1D %)")
-                losers = (
-                    today_change.tail(10)
-                    .sort_values("1D %")
-                )
-                st.dataframe(
-                    losers[["Last Price", "1D %", "5D %", "1M %", "Vol Spike"]].round(2)
-                )
+                losers = today_change.tail(10).sort_values("1D %")  # ensure sorted ascending
+                st.dataframe(losers[["Last Price", "1D %", "5D %", "1M %", "Vol Spike"]].round(2))
         else:
-            st.warning(
-                "Unable to compute gainers/losers because price data is missing."
-            )
+            st.warning("Unable to compute gainers/losers because price data is missing.")
     else:
         st.info("Add some symbols in the sidebar to see gainers/losers.")
 
-# ---------------------- TAB 3: OPTION CHAIN (YAHOO) ---------------------- #
+# ---------------------- TAB 3: OPTION CHAIN ---------------------- #
 with tab3:
-    st.subheader("Option Chain Analysis (via Yahoo Finance)")
+    st.subheader("Option Chain Analysis (NSE)")
 
     st.write(
-        """
-        Type an **index** (e.g. `NIFTY`, `BANKNIFTY`) or **stock** (e.g. `RELIANCE`, `TCS`).  
-        Data comes from Yahoo Finance options API (delayed).:contentReference[oaicite:5]{index=5}
-        """
+        "Type an **index** (e.g. `NIFTY`, `BANKNIFTY`) or **stock symbol** (e.g. `RELIANCE`, `TCS`)."
     )
 
-    oc_symbol = st.text_input("Underlying symbol", value="NIFTY").upper().strip()
+    oc_symbol = st.text_input("Underlying symbol (NSE)", value="NIFTY").upper().strip()
 
     if oc_symbol:
         try:
-            yf_symbol = map_to_yf_option_symbol(oc_symbol)
-            st.caption(f"Using Yahoo symbol: `{yf_symbol}`")
+            payload = fetch_option_chain(oc_symbol)
 
-            ticker, expiries = get_option_chain_from_yf(yf_symbol)
+            expiries = payload["records"]["expiryDates"]
+            sel_expiry = st.selectbox("Select expiry", options=expiries, index=0)
 
-            if not expiries:
-                st.warning("No option expiries found for this symbol.")
+            df_oc = option_chain_to_df(payload, sel_expiry)
+
+            if df_oc.empty:
+                st.warning("No option data found for this expiry.")
             else:
-                sel_expiry = st.selectbox("Select expiry", options=expiries, index=0)
+                # Compute PCR for this expiry using nsepython helper
+                try:
+                    pcr_val = pcr(payload, expiries.index(sel_expiry))
+                    st.metric("Put-Call Ratio (OI)", f"{pcr_val:.2f}")
+                except Exception:
+                    st.caption("PCR not available for this symbol/expiry.")
 
-                chain = ticker.option_chain(sel_expiry)
-                df_oc = build_option_chain_df(chain)
+                st.markdown("#### Option Chain Table")
+                st.dataframe(
+                    df_oc.set_index("strikePrice").round(2),
+                    use_container_width=True,
+                )
 
-                if df_oc.empty:
-                    st.warning("No option data available for this expiry.")
-                else:
-                    # PCR using OI
-                    ce_oi_sum = df_oc.get("CE_OI", pd.Series(dtype=float)).sum()
-                    pe_oi_sum = df_oc.get("PE_OI", pd.Series(dtype=float)).sum()
-                    pcr_val = (
-                        pe_oi_sum / ce_oi_sum if ce_oi_sum not in [0, np.nan] else np.nan
-                    )
-                    if not np.isnan(pcr_val):
-                        st.metric("Put-Call Ratio (OI)", f"{pcr_val:.2f}")
-                    else:
-                        st.caption("PCR not available (missing OI data).")
+                # Plots
+                st.markdown("#### Open Interest by Strike")
 
-                    st.markdown("#### Option Chain Table")
-                    st.dataframe(
-                        df_oc.set_index("strikePrice").round(2),
-                        use_container_width=True,
-                    )
+                col1, col2 = st.columns(2)
 
-                    # OI charts
-                    st.markdown("#### Open Interest by Strike")
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        if "CE_OI" in df_oc.columns:
-                            fig_ce = go.Figure()
-                            fig_ce.add_trace(
-                                go.Bar(
-                                    x=df_oc["strikePrice"],
-                                    y=df_oc["CE_OI"],
-                                    name="CE OI",
-                                )
-                            )
-                            fig_ce.update_layout(
-                                xaxis_title="Strike Price",
-                                yaxis_title="Call OI",
-                            )
-                            st.plotly_chart(fig_ce, use_container_width=True)
-                        else:
-                            st.caption("Call OI not available in data.")
-
-                    with col2:
-                        if "PE_OI" in df_oc.columns:
-                            fig_pe = go.Figure()
-                            fig_pe.add_trace(
-                                go.Bar(
-                                    x=df_oc["strikePrice"],
-                                    y=df_oc["PE_OI"],
-                                    name="PE OI",
-                                )
-                            )
-                            fig_pe.update_layout(
-                                xaxis_title="Strike Price",
-                                yaxis_title="Put OI",
-                            )
-                            st.plotly_chart(fig_pe, use_container_width=True)
-                        else:
-                            st.caption("Put OI not available in data.")
-
-                    # Volume / sentiment-style view
-                    st.markdown("#### Volume (Liquidity) by Strike")
-                    if "CE_Volume" in df_oc.columns or "PE_Volume" in df_oc.columns:
-                        fig_vol = go.Figure()
-                        if "CE_Volume" in df_oc.columns:
-                            fig_vol.add_trace(
-                                go.Bar(
-                                    x=df_oc["strikePrice"],
-                                    y=df_oc["CE_Volume"],
-                                    name="CE Volume",
-                                )
-                            )
-                        if "PE_Volume" in df_oc.columns:
-                            fig_vol.add_trace(
-                                go.Bar(
-                                    x=df_oc["strikePrice"],
-                                    y=df_oc["PE_Volume"],
-                                    name="PE Volume",
-                                )
-                            )
-                        fig_vol.update_layout(
-                            barmode="group",
-                            xaxis_title="Strike Price",
-                            yaxis_title="Volume",
+                with col1:
+                    fig_ce = go.Figure()
+                    fig_ce.add_trace(
+                        go.Bar(
+                            x=df_oc["strikePrice"],
+                            y=df_oc["CE_OI"],
+                            name="CE OI",
                         )
-                        st.plotly_chart(fig_vol, use_container_width=True)
-
-                    st.markdown(
-                        """
-                        **How to read this:**
-                        - Strikes with high **Call OI** → potential **resistance** zones  
-                        - Strikes with high **Put OI** → potential **support** zones  
-                        - **PCR (OI)** near 1 is neutral; very low/high can signal extreme sentiment.  
-                        - Remember: Yahoo data is delayed and may not match live NSE ticks exactly.
-                        """
                     )
+                    fig_ce.update_layout(
+                        xaxis_title="Strike Price",
+                        yaxis_title="Call OI",
+                    )
+                    st.plotly_chart(fig_ce, use_container_width=True)
+
+                with col2:
+                    fig_pe = go.Figure()
+                    fig_pe.add_trace(
+                        go.Bar(
+                            x=df_oc["strikePrice"],
+                            y=df_oc["PE_OI"],
+                            name="PE OI",
+                        )
+                    )
+                    fig_pe.update_layout(
+                        xaxis_title="Strike Price",
+                        yaxis_title="Put OI",
+                    )
+                    st.plotly_chart(fig_pe, use_container_width=True)
+
+                st.markdown("#### Change in Open Interest (Intraday sentiment)")
+                fig_chg = go.Figure()
+                fig_chg.add_trace(
+                    go.Bar(
+                        x=df_oc["strikePrice"],
+                        y=df_oc["CE_Change_OI"],
+                        name="CE ΔOI",
+                    )
+                )
+                fig_chg.add_trace(
+                    go.Bar(
+                        x=df_oc["strikePrice"],
+                        y=df_oc["PE_Change_OI"],
+                        name="PE ΔOI",
+                    )
+                )
+                fig_chg.update_layout(
+                    barmode="group",
+                    xaxis_title="Strike Price",
+                    yaxis_title="Change in OI",
+                )
+                st.plotly_chart(fig_chg, use_container_width=True)
+
+                st.markdown(
+                    """
+                    **How to read this:**
+                    - High **Call OI** at a strike → potential **resistance** zone  
+                    - High **Put OI** at a strike → potential **support** zone  
+                    - **Change in OI** helps you see where fresh positions are building.  
+                    - **PCR** close to 1 = neutral. Very low/high can indicate extreme sentiment.
+                    """
+                )
+
         except Exception as e:
             st.error(
-                "Could not fetch option chain (Yahoo Finance error or rate limit). "
-                "Try again after some time or with a different symbol."
+                "Could not fetch option chain. "
+                "NSE sometimes blocks cloud IPs or changes endpoints. "
+                "Try again, change network, or use a local setup if it persists."
             )
             st.exception(e)
