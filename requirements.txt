@@ -1,0 +1,338 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+
+# nsepython imports
+from nsepython import nse_optionchain_scrapper, pcr, expiry_list, indiavix
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ---------------------- PAGE CONFIG ---------------------- #
+st.set_page_config(
+    page_title="NSE Market Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.title("📊 NSE Market Dashboard with Option Chain Analysis")
+st.caption("Educational / personal use only – data from public sources, not for live trading decisions.")
+
+# ---------------------- HELPER FUNCTIONS ---------------------- #
+
+@st.cache_data(ttl=300)
+def get_yf_data(tickers, period="3mo", interval="1d"):
+    if not tickers:
+        return None
+    data = yf.download(tickers, period=period, interval=interval, progress=False, group_by="ticker", auto_adjust=True)
+    return data
+
+def parse_watchlist(text):
+    if not text:
+        return []
+    syms = [s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()]
+    # yfinance uses .NS for NSE stocks
+    yf_syms = [s + ".NS" for s in syms]
+    return syms, yf_syms
+
+def compute_trending_metrics(raw_symbols, yf_symbols, period="1mo"):
+    if not yf_symbols:
+        return pd.DataFrame()
+
+    data = get_yf_data(yf_symbols, period=period, interval="1d")
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    closing = {}
+    volume = {}
+
+    # yfinance shape differs for single vs multi ticker
+    if isinstance(data.columns, pd.MultiIndex):
+        for s, yf_s in zip(raw_symbols, yf_symbols):
+            if (yf_s, "Close") in data.columns:
+                closing[s] = data[(yf_s, "Close")]
+                volume[s] = data[(yf_s, "Volume")]
+    else:
+        # single symbol
+        s = raw_symbols[0]
+        closing[s] = data["Close"]
+        volume[s] = data["Volume"]
+
+    close_df = pd.DataFrame(closing)
+    vol_df = pd.DataFrame(volume)
+
+    latest = close_df.iloc[-1]
+    prev = close_df.iloc[-2] if len(close_df) > 1 else close_df.iloc[-1]
+    week_back_idx = max(0, len(close_df) - 6)
+    month_back_idx = max(0, len(close_df) - 21)
+
+    week_back = close_df.iloc[week_back_idx]
+    month_back = close_df.iloc[month_back_idx]
+
+    latest_vol = vol_df.iloc[-1]
+    avg_vol_20 = vol_df.tail(20).mean()
+
+    df = pd.DataFrame(index=latest.index)
+    df["Last Price"] = latest
+    df["1D %"] = (latest - prev) / prev * 100
+    df["5D %"] = (latest - week_back) / week_back * 100
+    df["1M %"] = (latest - month_back) / month_back * 100
+    df["Latest Vol"] = latest_vol
+    df["Avg Vol 20D"] = avg_vol_20
+    df["Vol Spike"] = df["Latest Vol"] / df["Avg Vol 20D"]
+
+    # Simple trend score
+    df["Trend Score"] = (
+        df["1D %"] * 0.4 +
+        df["5D %"] * 0.3 +
+        df["1M %"] * 0.2 +
+        (df["Vol Spike"] - 1).fillna(0) * 5  # overweight big spikes
+    )
+
+    return df.sort_values("Trend Score", ascending=False)
+
+def option_chain_to_df(payload, expiry):
+    rows = []
+    for row in payload["records"]["data"]:
+        if row.get("expiryDate") != expiry:
+            continue
+        strike = row.get("strikePrice")
+        ce = row.get("CE", {})
+        pe = row.get("PE", {})
+        rows.append(
+            {
+                "strikePrice": strike,
+                "CE_OI": ce.get("openInterest"),
+                "CE_Change_OI": ce.get("changeinOpenInterest"),
+                "CE_LTP": ce.get("lastPrice"),
+                "CE_Volume": ce.get("totalTradedVolume"),
+                "PE_OI": pe.get("openInterest"),
+                "PE_Change_OI": pe.get("changeinOpenInterest"),
+                "PE_LTP": pe.get("lastPrice"),
+                "PE_Volume": pe.get("totalTradedVolume"),
+            }
+        )
+    df = pd.DataFrame(rows).sort_values("strikePrice")
+    return df
+
+@st.cache_data(ttl=60)
+def fetch_option_chain(symbol):
+    # symbol: NIFTY, BANKNIFTY, or stock e.g. RELIANCE
+    payload = nse_optionchain_scrapper(symbol.upper())
+    return payload
+
+# ---------------------- SIDEBAR ---------------------- #
+st.sidebar.header("⚙️ Settings")
+
+default_watchlist = "RELIANCE,TCS,INFY,ICICIBANK,HDFCBANK,SBIN,AXISBANK,LT"
+watchlist_text = st.sidebar.text_area(
+    "Watchlist symbols (NSE, comma separated)",
+    value=default_watchlist,
+    height=100,
+    help="Example: RELIANCE,TCS,INFY,SBIN"
+)
+
+trend_period = st.sidebar.selectbox(
+    "Trend lookback for stocks",
+    options=["1mo", "3mo", "6mo"],
+    index=0
+)
+
+st.sidebar.info(
+    "You can open this app from any laptop once deployed on Streamlit Cloud.\n"
+    "Just paste/update your watchlist here."
+)
+
+# ---------------------- TABS ---------------------- #
+tab1, tab2, tab3 = st.tabs(
+    ["📈 Market & Stocks", "📊 Gainers / Losers", "🧮 Option Chain Analysis"]
+)
+
+# ---------------------- TAB 1: MARKET & TRENDING ---------------------- #
+with tab1:
+    st.subheader("Market Overview & Trending Stocks")
+
+    raw_syms, yf_syms = parse_watchlist(watchlist_text)
+
+    cols = st.columns(2)
+
+    with cols[0]:
+        st.markdown("#### 🔍 Trending in Your Watchlist")
+        if yf_syms:
+            trend_df = compute_trending_metrics(raw_syms, yf_syms, period=trend_period)
+            if not trend_df.empty:
+                st.dataframe(
+                    trend_df.round(2),
+                    use_container_width=True,
+                )
+
+                # Bar chart of Trend Score
+                top_n = st.slider("Show top N by Trend Score", 3, min(15, len(trend_df)), 10)
+                chart_df = trend_df.head(top_n).reset_index().rename(columns={"index": "Symbol"})
+                fig = px.bar(
+                    chart_df,
+                    x="Symbol",
+                    y="Trend Score",
+                    hover_data=["1D %", "5D %", "1M %", "Vol Spike"]
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Could not fetch data for your watchlist. Try a different set or check internet connectivity.")
+        else:
+            st.info("Add some symbols in the sidebar to see trending stocks.")
+
+    with cols[1]:
+        st.markdown("#### ℹ️ Notes")
+        st.write(
+            """
+            - **Trend Score** mixes:
+              - 1D / 5D / 1M % returns  
+              - 20D volume spike  
+            - Higher score ≈ more trending (momentum + activity).  
+            - This is for **educational analysis only**, not a trading signal.
+            """
+        )
+        try:
+            vix = indiavix()
+            st.metric("India VIX (approx)", f"{vix:.2f}")
+        except Exception:
+            st.caption("India VIX unavailable right now.")
+
+# ---------------------- TAB 2: GAINERS / LOSERS ---------------------- #
+with tab2:
+    st.subheader("Top Gainers / Losers in Your Watchlist")
+
+    raw_syms, yf_syms = parse_watchlist(watchlist_text)
+    if yf_syms:
+        trend_df = compute_trending_metrics(raw_syms, yf_syms, period=trend_period)
+        if not trend_df.empty:
+            today_change = trend_df.sort_values("1D %", ascending=False)
+
+            col_g, col_l = st.columns(2)
+
+            with col_g:
+                st.markdown("##### 🔼 Top Gainers (1D %)")
+                gainers = today_change.head(10).copy()
+                st.dataframe(gainers[["Last Price", "1D %", "5D %", "1M %", "Vol Spike"]].round(2))
+
+            with col_l:
+                st.markdown("##### 🔽 Top Losers (1D %)")
+                losers = today_change.tail(10).sort_values("1D %")  # ensure sorted ascending
+                st.dataframe(losers[["Last Price", "1D %", "5D %", "1M %", "Vol Spike"]].round(2))
+        else:
+            st.warning("Unable to compute gainers/losers because price data is missing.")
+    else:
+        st.info("Add some symbols in the sidebar to see gainers/losers.")
+
+# ---------------------- TAB 3: OPTION CHAIN ---------------------- #
+with tab3:
+    st.subheader("Option Chain Analysis (NSE)")
+
+    st.write(
+        "Type an **index** (e.g. `NIFTY`, `BANKNIFTY`) or **stock symbol** (e.g. `RELIANCE`, `TCS`)."
+    )
+
+    oc_symbol = st.text_input("Underlying symbol (NSE)", value="NIFTY").upper().strip()
+
+    if oc_symbol:
+        try:
+            payload = fetch_option_chain(oc_symbol)
+
+            expiries = payload["records"]["expiryDates"]
+            sel_expiry = st.selectbox("Select expiry", options=expiries, index=0)
+
+            df_oc = option_chain_to_df(payload, sel_expiry)
+
+            if df_oc.empty:
+                st.warning("No option data found for this expiry.")
+            else:
+                # Compute PCR for this expiry using nsepython helper
+                try:
+                    pcr_val = pcr(payload, expiries.index(sel_expiry))
+                    st.metric("Put-Call Ratio (OI)", f"{pcr_val:.2f}")
+                except Exception:
+                    st.caption("PCR not available for this symbol/expiry.")
+
+                st.markdown("#### Option Chain Table")
+                st.dataframe(
+                    df_oc.set_index("strikePrice").round(2),
+                    use_container_width=True,
+                )
+
+                # Plots
+                st.markdown("#### Open Interest by Strike")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    fig_ce = go.Figure()
+                    fig_ce.add_trace(
+                        go.Bar(
+                            x=df_oc["strikePrice"],
+                            y=df_oc["CE_OI"],
+                            name="CE OI",
+                        )
+                    )
+                    fig_ce.update_layout(
+                        xaxis_title="Strike Price",
+                        yaxis_title="Call OI",
+                    )
+                    st.plotly_chart(fig_ce, use_container_width=True)
+
+                with col2:
+                    fig_pe = go.Figure()
+                    fig_pe.add_trace(
+                        go.Bar(
+                            x=df_oc["strikePrice"],
+                            y=df_oc["PE_OI"],
+                            name="PE OI",
+                        )
+                    )
+                    fig_pe.update_layout(
+                        xaxis_title="Strike Price",
+                        yaxis_title="Put OI",
+                    )
+                    st.plotly_chart(fig_pe, use_container_width=True)
+
+                st.markdown("#### Change in Open Interest (Intraday sentiment)")
+                fig_chg = go.Figure()
+                fig_chg.add_trace(
+                    go.Bar(
+                        x=df_oc["strikePrice"],
+                        y=df_oc["CE_Change_OI"],
+                        name="CE ΔOI",
+                    )
+                )
+                fig_chg.add_trace(
+                    go.Bar(
+                        x=df_oc["strikePrice"],
+                        y=df_oc["PE_Change_OI"],
+                        name="PE ΔOI",
+                    )
+                )
+                fig_chg.update_layout(
+                    barmode="group",
+                    xaxis_title="Strike Price",
+                    yaxis_title="Change in OI",
+                )
+                st.plotly_chart(fig_chg, use_container_width=True)
+
+                st.markdown(
+                    """
+                    **How to read this:**
+                    - High **Call OI** at a strike → potential **resistance** zone  
+                    - High **Put OI** at a strike → potential **support** zone  
+                    - **Change in OI** helps you see where fresh positions are building.  
+                    - **PCR** close to 1 = neutral. Very low/high can indicate extreme sentiment.
+                    """
+                )
+
+        except Exception as e:
+            st.error(
+                "Could not fetch option chain. "
+                "NSE sometimes blocks cloud IPs or changes endpoints. "
+                "Try again, change network, or use a local setup if it persists."
+            )
+            st.exception(e)
